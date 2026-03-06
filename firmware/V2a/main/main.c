@@ -6,6 +6,7 @@
 #endif
 
 #ifndef EPD_HELLO_TEST
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include "esp_log.h"
@@ -35,7 +36,7 @@
 
 static const char *TAG = "t1e";
 
-// Framebuffers in regular SRAM — NOT RTC slow memory
+// Framebuffers in regular SRAM (not RTC slow memory)
 static uint8_t fb[EPD_FB_SIZE];
 static uint8_t prev_fb[EPD_FB_SIZE];
 
@@ -45,22 +46,35 @@ static uint8_t prev_fb[EPD_FB_SIZE];
 #define WIFI_SYNC_EVERY_MS         (10U * 60U * 1000U)
 #define NTP_WAIT_TIMEOUT_MS        10000U
 
+// Button policies
+#define BUTTON_LONG_PRESS_MS       5000U
+#define CLOCK_DOUBLE_TAP_MS        1000U
+
+// Sleep policies
+#define CLOCK_SLEEP_SECONDS        60U
+#define CLOCK_SLEEP_GRACE_MS       1200U
+#define ENERGY_AWAKE_MS            (2U * 60U * 1000U)
+#define BATT_CHECK_MS              30000U
+
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static bool s_wifi_connected = false;
 static bool s_wifi_ready = false;
+static bool s_wifi_started = false;
 
 enum {
     WIFI_CONNECTED_BIT = BIT0,
     WIFI_FAIL_BIT = BIT1,
 };
 
-// refresh_speed index → update interval in milliseconds
+// refresh_speed index -> update interval in milliseconds
 static const uint32_t REFRESH_MS[REFRESH_SPEED_COUNT] = {100, 250, 500, 1000, 10000, 60000};
 
-// deghost_idx → ms between full-white deghost refresh (0 = disabled)
-static const uint32_t DEGHOST_MS[DEGHOST_IDX_COUNT] = {5*60*1000, 15*60*1000, 30*60*1000, 0};
+// deghost_idx -> ms between full-white deghost refresh (0 = disabled)
+static const uint32_t DEGHOST_MS[DEGHOST_IDX_COUNT] = {5 * 60 * 1000, 15 * 60 * 1000, 30 * 60 * 1000, 0};
+// Avoid extra full-white cycles when only a few partial updates have happened.
+#define DEGHOST_MIN_PARTIALS 8U
 
-static void render(t1e_state_t *s) {
+static void render_mode_frame(t1e_state_t *s) {
     switch (s->mode) {
         case MODE_CLOCK:      mode_clock_render(fb, s);      break;
         case MODE_LIFE_CLOCK: mode_life_clock_render(fb, s); break;
@@ -70,6 +84,21 @@ static void render(t1e_state_t *s) {
         case MODE_LIFE:       mode_life_render(fb, s);       break;
         case MODE_SETTINGS:   mode_settings_render(fb, s);   break;
         default:              mode_clock_render(fb, s);       break;
+    }
+}
+
+static void render_screensaver(void) {
+    gfx_clear(fb, GFX_WHITE);
+    gfx_puts_centered(fb, 88, "ZZZ", FONT_LARGE, GFX_BLACK);
+    gfx_puts_centered(fb, 124, ".....", FONT_LARGE, GFX_BLACK);
+    gfx_puts_centered(fb, 182, "PRESS A", FONT_SMALL, GFX_BLACK);
+}
+
+static void render(t1e_state_t *s) {
+    if (s->mode == MODE_CLOCK && s->screensaver_active) {
+        render_screensaver();
+    } else {
+        render_mode_frame(s);
     }
 }
 
@@ -153,11 +182,26 @@ static bool wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
 
     s_wifi_ready = true;
+    s_wifi_started = true;
     return true;
+}
+
+static void wifi_power_off(void) {
+    if (!s_wifi_ready) return;
+    if (s_wifi_started) {
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+    }
+    s_wifi_connected = false;
+    s_wifi_started = false;
 }
 
 static bool wifi_try_connect(uint32_t timeout_ms) {
     if (!s_wifi_ready || !s_wifi_event_group) return false;
+    if (!s_wifi_started) {
+        if (esp_wifi_start() != ESP_OK) return false;
+        s_wifi_started = true;
+    }
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     if (esp_wifi_connect() != ESP_OK) return false;
@@ -173,7 +217,10 @@ static bool wifi_try_connect(uint32_t timeout_ms) {
 }
 
 static bool ntp_sync_rtc_once(void) {
-    if (!s_wifi_connected) return false;
+    if (!s_wifi_connected) {
+        wifi_power_off();
+        return false;
+    }
 
     sntp_stop();
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -193,17 +240,88 @@ static bool ntp_sync_rtc_once(void) {
 
     if (now <= 1700000000) {
         ESP_LOGW(TAG, "NTP sync timeout");
+        wifi_power_off();
         return false;
     }
 
     now += (time_t)T1E_WIFI_UTC_OFFSET_SECONDS;
     if (!rtc_set_epoch((uint32_t)now)) {
         ESP_LOGW(TAG, "RTC update failed");
+        wifi_power_off();
         return false;
     }
 
     ESP_LOGI(TAG, "RTC updated from NTP");
+    wifi_power_off();
     return true;
+}
+
+static uint8_t month_from_abbr(const char *abbr) {
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    for (uint8_t i = 0; i < 12; i++) {
+        if (strncmp(abbr, months[i], 3) == 0) return (uint8_t)(i + 1);
+    }
+    return 0;
+}
+
+static void rtc_restore_from_build_time_if_needed(void) {
+    if (!rtc_lost_power()) return;
+
+    char mon[4] = {0};
+    int day = 0, year = 0;
+    int hour = 0, minute = 0, sec = 0;
+    if (sscanf(__DATE__, "%3s %d %d", mon, &day, &year) != 3) {
+        ESP_LOGW(TAG, "RTC lost power: failed to parse build date");
+        return;
+    }
+    if (sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &sec) != 3) {
+        ESP_LOGW(TAG, "RTC lost power: failed to parse build time");
+        return;
+    }
+
+    uint8_t month = month_from_abbr(mon);
+    if (month == 0 || day < 1 || day > 31 || year < 2000) {
+        ESP_LOGW(TAG, "RTC lost power: invalid build timestamp");
+        return;
+    }
+
+    rtc_time_t t = {
+        .sec = (uint8_t)sec,
+        .min = (uint8_t)minute,
+        .hour = (uint8_t)hour,
+        .dow = 1,
+        .day = (uint8_t)day,
+        .month = month,
+        .year = (uint16_t)year,
+    };
+    if (rtc_set_time(&t)) {
+        ESP_LOGW(TAG, "RTC lost power: set to build time %s %s", __DATE__, __TIME__);
+    } else {
+        ESP_LOGE(TAG, "RTC lost power: failed to write build time to RTC");
+    }
+}
+
+static void handle_b_short_press(t1e_state_t *s, bool *need_refresh, bool *force_full) {
+    if (s->mode == MODE_SETTINGS) {
+        uint8_t invert_before = s->display_invert;
+        mode_settings_confirm(s);
+        if (s->display_invert != invert_before) *force_full = true;
+    } else if (s->mode == MODE_DICE) {
+        if (s->dice_type < DICE_COUNT - 1) {
+            s->dice_type++;
+            s->last_roll = 0;
+        } else {
+            s->dice_type = DICE_D20;
+            s->last_roll = 0;
+            state_next_mode(s);
+        }
+    } else {
+        state_next_mode(s);
+    }
+    *need_refresh = true;
 }
 #endif
 
@@ -214,9 +332,23 @@ void app_main(void) {
 #else
     ESP_LOGI(TAG, "=== T1E BOOT ===");
 
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    uint64_t wake_mask = esp_sleep_get_gpio_wakeup_status();
+    bool wake_by_a = (wake_mask & (1ULL << PIN_BTN_A)) != 0;
+
     hal_buttons_init();
     hal_power_init();
-    if (!rtc_init()) ESP_LOGE(TAG, "RTC FAILED");
+    if (hal_power_is_critical()) {
+        ESP_LOGE(TAG, "Battery critically low, entering indefinite sleep");
+        hal_sleep_enter_indefinite();
+    }
+
+    bool rtc_ok = rtc_init();
+    if (!rtc_ok) {
+        ESP_LOGE(TAG, "RTC FAILED");
+    } else {
+        rtc_restore_from_build_time_if_needed();
+    }
     epd_init();
 
     t1e_state_t *s = state_get();
@@ -224,63 +356,188 @@ void app_main(void) {
         state_init_defaults(s);
     }
 
-    // Cold boot: full refresh to establish clean baseline in both RAMs
+    uint32_t now = xTaskGetTickCount();
+    uint32_t energy_awake_deadline = 0;
+    if (s->energy_saver_enabled && s->mode == MODE_CLOCK) {
+        if (s->screensaver_active && wake_by_a && wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+            s->screensaver_active = 0;
+            energy_awake_deadline = now + pdMS_TO_TICKS(ENERGY_AWAKE_MS);
+        } else if (!s->screensaver_active) {
+            energy_awake_deadline = now + pdMS_TO_TICKS(ENERGY_AWAKE_MS);
+        }
+    }
+
+    bool wifi_available = wifi_init_sta();
+    if (wifi_available && !s->wifi_user_enabled) {
+        wifi_power_off();
+    }
+
+    static int last_min = -1;
+
     render(s);
-    if (s->display_invert)
+    if (s->display_invert) {
         for (int i = 0; i < EPD_FB_SIZE; i++) fb[i] ^= 0xFF;
+    }
     epd_refresh_full(fb);
     memcpy(prev_fb, fb, EPD_FB_SIZE);
 
+    rtc_time_t boot_time = {0};
+    if (rtc_get_time(&boot_time)) {
+        last_min = boot_time.min;
+    }
+
+    if (s->energy_saver_enabled && s->mode == MODE_CLOCK && s->screensaver_active) {
+        hal_sleep_enter_until_a();
+    }
+
     uint32_t last_refresh = xTaskGetTickCount();
     uint32_t ghost_timer  = xTaskGetTickCount();
-    bool wifi_enabled = wifi_init_sta();
     uint32_t next_wifi_sync = xTaskGetTickCount();
     uint32_t next_wifi_reconnect = xTaskGetTickCount();
+    uint32_t next_batt_check = xTaskGetTickCount() + pdMS_TO_TICKS(BATT_CHECK_MS);
+
+    bool a_down = false;
+    bool b_down = false;
+    bool a_long_handled = false;
+    bool b_long_handled = false;
+    uint32_t a_press_start = 0;
+    uint32_t b_press_start = 0;
+    bool a_tap_pending = false;
+    uint32_t a_tap_deadline = 0;
+
+    bool pending_clock_sleep = (s->mode == MODE_CLOCK && !s->energy_saver_enabled && !s->screensaver_active);
+    uint32_t clock_sleep_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(CLOCK_SLEEP_GRACE_MS);
 
     while (1) {
+        now = xTaskGetTickCount();
         btn_state_t btn = hal_buttons_read();
         bool need_refresh = false;
-        bool force_full   = false;
-        bool do_deghost   = false;
+        bool force_full = false;
+        bool do_deghost = false;
 
-        // --- Button A: secondary action ---
-        if (btn.a) {
-            action(s);
-            need_refresh = true;
+        if (tick_reached(now, next_batt_check)) {
+            next_batt_check = now + pdMS_TO_TICKS(BATT_CHECK_MS);
+            if (hal_power_is_critical()) {
+                ESP_LOGE(TAG, "Battery critically low, entering indefinite sleep");
+                hal_sleep_enter_indefinite();
+            }
         }
 
-        // --- Button B: confirm / mode advance ---
-        if (btn.b) {
-            if (s->mode == MODE_SETTINGS) {
-                uint8_t invert_before = s->display_invert;
-                mode_settings_confirm(s);
-                // If invert just toggled, force a full refresh to reset RAM baseline
-                if (s->display_invert != invert_before) force_full = true;
-            } else if (s->mode == MODE_DICE) {
-                if (s->dice_type < DICE_COUNT - 1) {
-                    s->dice_type++;
-                    s->last_roll = 0;
-                } else {
-                    s->dice_type = DICE_D20;
-                    s->last_roll = 0;
-                    state_next_mode(s);
-                }
+        if (btn.raw_a && !a_down) {
+            a_down = true;
+            a_long_handled = false;
+            a_press_start = now;
+        }
+        if (btn.raw_b && !b_down) {
+            b_down = true;
+            b_long_handled = false;
+            b_press_start = now;
+        }
+
+        if (a_down && btn.raw_a && !a_long_handled && (now - a_press_start >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS))) {
+            a_long_handled = true;
+            a_tap_pending = false;
+            if (!wifi_available) {
+                ESP_LOGW(TAG, "Wi-Fi toggle ignored: Wi-Fi credentials missing");
             } else {
-                state_next_mode(s);
+                s->wifi_user_enabled = !s->wifi_user_enabled;
+                ESP_LOGI(TAG, "Wi-Fi toggled %s", s->wifi_user_enabled ? "ON" : "OFF");
+                if (!s->wifi_user_enabled) {
+                    wifi_power_off();
+                } else {
+                    if (wifi_try_connect(WIFI_CONNECT_TIMEOUT_MS)) {
+                        if (ntp_sync_rtc_once()) need_refresh = true;
+                        next_wifi_sync = now + pdMS_TO_TICKS(WIFI_SYNC_EVERY_MS);
+                    } else {
+                        ESP_LOGW(TAG, "Wi-Fi connect failed after toggle ON");
+                    }
+                    next_wifi_reconnect = now + pdMS_TO_TICKS(WIFI_RECONNECT_EVERY_MS);
+                }
+            }
+        }
+
+        if (b_down && btn.raw_b && !b_long_handled && (now - b_press_start >= pdMS_TO_TICKS(BUTTON_LONG_PRESS_MS))) {
+            b_long_handled = true;
+            a_tap_pending = false;
+            s->energy_saver_enabled = !s->energy_saver_enabled;
+            ESP_LOGI(TAG, "Energy saver toggled %s", s->energy_saver_enabled ? "ON" : "OFF");
+            if (s->energy_saver_enabled) {
+                s->mode = MODE_CLOCK;
+                s->screensaver_active = 1;
+                energy_awake_deadline = 0;
+            } else {
+                s->screensaver_active = 0;
+                energy_awake_deadline = now + pdMS_TO_TICKS(ENERGY_AWAKE_MS);
             }
             need_refresh = true;
         }
 
-        // --- Time-based refresh ---
-        uint32_t now = xTaskGetTickCount(); // ticks (1 tick = 1ms at default ESP32 config)
+        if (!btn.raw_a && a_down) {
+            bool was_long = a_long_handled;
+            uint32_t held_ms = now - a_press_start;
+            a_down = false;
+            a_long_handled = false;
 
-        // --- Wi-Fi / NTP time sync ---
-        if (wifi_enabled) {
+            if (!was_long && held_ms >= pdMS_TO_TICKS(30)) {
+                if (s->mode == MODE_CLOCK) {
+                    if (s->screensaver_active) {
+                        s->screensaver_active = 0;
+                        if (s->energy_saver_enabled) {
+                            energy_awake_deadline = now + pdMS_TO_TICKS(ENERGY_AWAKE_MS);
+                        }
+                        need_refresh = true;
+                    } else if (a_tap_pending && !tick_reached(now, a_tap_deadline)) {
+                        a_tap_pending = false;
+                        mode_clock_action(s);
+                        need_refresh = true;
+                    } else {
+                        a_tap_pending = true;
+                        a_tap_deadline = now + pdMS_TO_TICKS(CLOCK_DOUBLE_TAP_MS);
+                    }
+                } else {
+                    action(s);
+                    need_refresh = true;
+                }
+            }
+        }
+
+        if (!btn.raw_b && b_down) {
+            bool was_long = b_long_handled;
+            uint32_t held_ms = now - b_press_start;
+            b_down = false;
+            b_long_handled = false;
+
+            if (!was_long && held_ms >= pdMS_TO_TICKS(30)) {
+                if (!(s->mode == MODE_CLOCK && s->screensaver_active)) {
+                    handle_b_short_press(s, &need_refresh, &force_full);
+                }
+            }
+        }
+
+        if (a_tap_pending && tick_reached(now, a_tap_deadline)) {
+            a_tap_pending = false;
+            if (s->mode == MODE_CLOCK && !s->screensaver_active) {
+                s->screensaver_active = 1;
+                need_refresh = true;
+            }
+        }
+
+        if (s->energy_saver_enabled && s->mode == MODE_CLOCK && !s->screensaver_active) {
+            if (energy_awake_deadline == 0) {
+                energy_awake_deadline = now + pdMS_TO_TICKS(ENERGY_AWAKE_MS);
+            } else if (tick_reached(now, energy_awake_deadline)) {
+                s->screensaver_active = 1;
+                energy_awake_deadline = 0;
+                need_refresh = true;
+            }
+        }
+
+        if (wifi_available && s->wifi_user_enabled) {
             if (!s_wifi_connected && tick_reached(now, next_wifi_reconnect)) {
                 ESP_LOGI(TAG, "Wi-Fi connect attempt...");
                 if (wifi_try_connect(WIFI_CONNECT_TIMEOUT_MS)) {
                     ESP_LOGI(TAG, "Wi-Fi connected");
-                    next_wifi_sync = now; // sync immediately on successful connect
+                    next_wifi_sync = now;
                 } else {
                     ESP_LOGW(TAG, "Wi-Fi connect failed");
                 }
@@ -289,58 +546,53 @@ void app_main(void) {
 
             if (s_wifi_connected && tick_reached(now, next_wifi_sync)) {
                 if (ntp_sync_rtc_once()) {
-                    need_refresh = true; // clock/date may have changed
+                    need_refresh = true;
                 }
                 next_wifi_sync = now + pdMS_TO_TICKS(WIFI_SYNC_EVERY_MS);
+                next_wifi_reconnect = now + pdMS_TO_TICKS(WIFI_RECONNECT_EVERY_MS);
             }
         }
 
-        uint32_t interval_ticks = pdMS_TO_TICKS(REFRESH_MS[s->refresh_speed % REFRESH_SPEED_COUNT]);
-        // POMO countdown always needs 1s resolution
-        if (s->mode == MODE_POMO && s->pomo_start) interval_ticks = pdMS_TO_TICKS(1000);
+        if (!(s->mode == MODE_CLOCK && s->screensaver_active)) {
+            uint32_t interval_ticks = pdMS_TO_TICKS(REFRESH_MS[s->refresh_speed % REFRESH_SPEED_COUNT]);
+            if (s->mode == MODE_POMO && s->pomo_start) interval_ticks = pdMS_TO_TICKS(1000);
 
-        static int last_min = -1;
-        if (s->mode == MODE_CLOCK || s->mode == MODE_LIFE_CLOCK) {
-            // For clock modes, only refresh when the minute actually changes.
-            // We ignore interval_ticks entirely, but poll gently every 1 second.
-            if (now - last_refresh >= pdMS_TO_TICKS(1000)) {
-                rtc_time_t t = {0};
-                if (rtc_get_time(&t)) {
-                    if (t.min != last_min) {
-                        need_refresh = true;
-                        last_min = t.min;
+            if (s->mode == MODE_CLOCK || s->mode == MODE_LIFE_CLOCK) {
+                if (now - last_refresh >= pdMS_TO_TICKS(1000)) {
+                    rtc_time_t t = {0};
+                    if (rtc_get_time(&t)) {
+                        if (t.min != last_min) {
+                            need_refresh = true;
+                            last_min = t.min;
+                        }
                     }
+                    last_refresh = now;
                 }
-                last_refresh = now;
+            } else {
+                if (now - last_refresh >= interval_ticks) {
+                    need_refresh = true;
+                    last_refresh = now;
+                }
             }
-        } else {
-            // Normal global refresh interval for non-clock modes
-            if (now - last_refresh >= interval_ticks) {
+
+            uint32_t dghost_ms = DEGHOST_MS[s->deghost_idx % DEGHOST_IDX_COUNT];
+            if (dghost_ms > 0 &&
+                now - ghost_timer >= pdMS_TO_TICKS(dghost_ms) &&
+                s->partial_count >= DEGHOST_MIN_PARTIALS) {
+                do_deghost = true;
                 need_refresh = true;
-                last_refresh = now;
+                ghost_timer = now;
             }
         }
 
-        // --- Deghost watchdog ---
-        // Banks display to all-white then partial-refreshes back to current frame.
-        // This clears image retention without a jarring double-flash.
-        uint32_t dghost_ms = DEGHOST_MS[s->deghost_idx % DEGHOST_IDX_COUNT];
-        if (dghost_ms > 0 && now - ghost_timer >= pdMS_TO_TICKS(dghost_ms)) {
-            do_deghost   = true;
-            need_refresh = true;
-            ghost_timer  = now;
-        }
-
-        // --- Render and refresh ---
         if (need_refresh) {
             render(s);
 
-            // Apply inversion if enabled
-            if (s->display_invert)
+            if (s->display_invert) {
                 for (int i = 0; i < EPD_FB_SIZE; i++) fb[i] ^= 0xFF;
+            }
 
             if (do_deghost) {
-                // Full white refresh to clear ghosting, then partial back to frame
                 epd_deghost(fb);
                 s->partial_count = 0;
             } else if (force_full) {
@@ -351,6 +603,21 @@ void app_main(void) {
             }
 
             memcpy(prev_fb, fb, EPD_FB_SIZE);
+
+            if (s->energy_saver_enabled && s->mode == MODE_CLOCK && s->screensaver_active) {
+                hal_sleep_enter_until_a();
+            }
+
+            pending_clock_sleep = (s->mode == MODE_CLOCK && !s->energy_saver_enabled && !s->screensaver_active);
+            if (pending_clock_sleep) {
+                clock_sleep_deadline = now + pdMS_TO_TICKS(CLOCK_SLEEP_GRACE_MS);
+            }
+        }
+
+        if (pending_clock_sleep &&
+            tick_reached(now, clock_sleep_deadline) &&
+            !a_down && !b_down && !a_tap_pending) {
+            hal_sleep_enter(CLOCK_SLEEP_SECONDS);
         }
 
         vTaskDelay(pdMS_TO_TICKS(30));

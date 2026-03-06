@@ -60,15 +60,15 @@ void mode_settings_render(uint8_t *fb, t1e_state_t *s) {
         }
     }
 
-    gfx_puts_centered(fb, 195, "A:OK  B:NEXT", FONT_SMALL, GFX_BLACK);
+    gfx_puts_centered(fb, 195, "A:NEXT B:OK", FONT_SMALL, GFX_BLACK);
 }
 
-// B button: advance cursor
+// Action button: advance cursor
 void mode_settings_action(t1e_state_t *s) {
     s->dice_preset = (s->dice_preset + 1) % SET_ITEMS;
 }
 
-// A button: activate selected item
+// Confirm button: activate selected item
 void mode_settings_confirm(t1e_state_t *s) {
     int cursor = s->dice_preset % SET_ITEMS;
     switch (cursor) {

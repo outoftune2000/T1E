@@ -22,6 +22,14 @@ static bool i2c_write(uint8_t reg, const uint8_t *data, size_t len) {
     return i2c_master_transmit(dev_handle, buf, len + 1, 100) == ESP_OK;
 }
 
+static bool rtc_clear_lost_power_flag(void) {
+    uint8_t status = 0;
+    if (!i2c_read(0x0F, &status, 1)) return false;
+    if ((status & 0x80) == 0) return true;
+    status &= (uint8_t)~0x80;
+    return i2c_write(0x0F, &status, 1);
+}
+
 bool rtc_init(void) {
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_PORT,
@@ -75,7 +83,8 @@ bool rtc_set_time(const rtc_time_t *t) {
         dec2bcd(t->sec), dec2bcd(t->min), dec2bcd(t->hour),
         t->dow, dec2bcd(t->day), dec2bcd(t->month), dec2bcd(t->year - 2000),
     };
-    return i2c_write(0x00, r, 7);
+    if (!i2c_write(0x00, r, 7)) return false;
+    return rtc_clear_lost_power_flag();
 }
 
 bool rtc_set_epoch(uint32_t epoch) {

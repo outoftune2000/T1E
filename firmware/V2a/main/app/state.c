@@ -19,6 +19,9 @@ void state_init_defaults(t1e_state_t *s) {
     s->refresh_speed = 4;   // 60s default
     s->deghost_idx   = 1;   // 15min default
     s->display_invert = 0;  // normal
+    s->wifi_user_enabled = 1;
+    s->energy_saver_enabled = 0;
+    s->screensaver_active = 0;
 }
 
 t1e_mode_t state_next_mode(t1e_state_t *s) {

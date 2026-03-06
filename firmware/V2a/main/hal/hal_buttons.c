@@ -40,6 +40,8 @@ btn_state_t hal_buttons_read(void) {
         .a = edge_a && !raw_b,
         .b = edge_b && !raw_a,
         .both = edge_a && edge_b,
+        .raw_a = raw_a,
+        .raw_b = raw_b,
     };
 
     if (state.a || state.b || state.both) {

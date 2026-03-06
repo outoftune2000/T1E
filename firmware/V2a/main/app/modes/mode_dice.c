@@ -59,7 +59,7 @@ void mode_dice_render(uint8_t *fb, t1e_state_t *s) {
             gfx_puts_centered(fb, 125, "?", FONT_LARGE, GFX_BLACK);
         }
 
-        gfx_puts_centered(fb, 185, "B:ROLL", FONT_SMALL, GFX_BLACK);
+        gfx_puts_centered(fb, 185, "A:ROLL B:DIE", FONT_SMALL, GFX_BLACK);
     }
 
     draw_corner_clock(fb);

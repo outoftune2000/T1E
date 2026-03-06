@@ -18,7 +18,7 @@ void mode_pomo_render(uint8_t *fb, t1e_state_t *s) {
         snprintf(buf, sizeof(buf), "%d DONE", s->pomo_count);
         gfx_puts_centered(fb, 130, buf, FONT_MEDIUM, GFX_BLACK);
 
-        gfx_puts_centered(fb, 185, "B:START", FONT_SMALL, GFX_BLACK);
+        gfx_puts_centered(fb, 185, "A:START", FONT_SMALL, GFX_BLACK);
     } else {
         // Active timer
         rtc_time_t t = {0};
@@ -72,7 +72,7 @@ void mode_pomo_render(uint8_t *fb, t1e_state_t *s) {
         snprintf(cnt, sizeof(cnt), "#%d", s->pomo_count + 1);
         gfx_puts_centered(fb, 175, cnt, FONT_SMALL, GFX_BLACK);
 
-        gfx_puts_centered(fb, 195, "B:CANCEL", FONT_SMALL, GFX_BLACK);
+        gfx_puts_centered(fb, 195, "A:CANCEL", FONT_SMALL, GFX_BLACK);
     }
 
     draw_corner_clock(fb);
