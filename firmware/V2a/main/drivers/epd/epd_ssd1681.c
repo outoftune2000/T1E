@@ -25,13 +25,24 @@
 #include "hal_pins.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "esp_check.h"
+#ifndef EPD_HELLO_TEST
 #include "esp_log.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
 
+#ifndef EPD_HELLO_TEST
 static const char *TAG = "epd";
+#endif
 static spi_device_handle_t spi_dev = NULL;
+
+#ifdef BOARD_VARIANT_C3
+#define EPD_C3_FORCE_FULL_REFRESH 1
+#else
+#define EPD_C3_FORCE_FULL_REFRESH 0
+#endif
 
 // Partial waveform LUT for SSD1681 / GDEY0154D67.
 // Bytes 0–152 → register 0x32 (waveform table).
@@ -113,7 +124,9 @@ void epd_wait_busy(void) {
     int timeout = 500;
     while (gpio_get_level(PIN_EPD_BUSY) == 1 && timeout-- > 0)
         vTaskDelay(pdMS_TO_TICKS(10));
+#ifndef EPD_HELLO_TEST
     if (timeout <= 0) ESP_LOGW(TAG, "BUSY timeout!");
+#endif
 }
 
 bool epd_is_busy(void) {
@@ -195,7 +208,9 @@ void epd_init(void) {
     cmd1(0x18, 0x80);            // internal temp sensor
     set_ram_area(0, 0, EPD_WIDTH, EPD_HEIGHT);
 
+#ifndef EPD_HELLO_TEST
     ESP_LOGI(TAG, "EPD init OK (GDEY0154D67)");
+#endif
 }
 
 /* ---- Full refresh ----
@@ -314,12 +329,21 @@ void epd_deghost(const uint8_t *fb) {
 
 void epd_refresh_partial(const uint8_t *old_fb, const uint8_t *new_fb) {
     (void)old_fb;
+#if EPD_C3_FORCE_FULL_REFRESH
+    epd_refresh_full(new_fb);
+#else
     do_partial(new_fb, 0, 0, EPD_WIDTH, EPD_HEIGHT);
+#endif
 }
 
 void epd_refresh_window(const uint8_t *old_fb, const uint8_t *new_fb, epd_rect_t rect) {
     (void)old_fb;
     if (rect.w == 0 || rect.h == 0) return;
+
+#if EPD_C3_FORCE_FULL_REFRESH
+    epd_refresh_full(new_fb);
+    return;
+#endif
 
     // Byte-align X to 8-pixel boundary
     uint16_t x0 = (rect.x / 8) * 8;
@@ -331,6 +355,13 @@ void epd_refresh_window(const uint8_t *old_fb, const uint8_t *new_fb, epd_rect_t
 
 epd_refresh_t epd_refresh_smart(const uint8_t *old_fb, const uint8_t *new_fb,
                                  uint8_t *partial_count, bool force_full) {
+#if EPD_C3_FORCE_FULL_REFRESH
+    (void)old_fb;
+    (void)force_full;
+    epd_refresh_full(new_fb);
+    *partial_count = 0;
+    return EPD_REFRESH_FULL;
+#else
     if (force_full) {
         epd_refresh_full(new_fb);
         *partial_count = 0;
@@ -341,15 +372,23 @@ epd_refresh_t epd_refresh_smart(const uint8_t *old_fb, const uint8_t *new_fb,
     epd_refresh_window(old_fb, new_fb, diff);
     (*partial_count)++;
     return EPD_REFRESH_PARTIAL;
+#endif
 }
 
 epd_refresh_t epd_refresh_animate(const uint8_t *old_fb, const uint8_t *new_fb,
                                    uint8_t *partial_count) {
+#if EPD_C3_FORCE_FULL_REFRESH
+    (void)old_fb;
+    epd_refresh_full(new_fb);
+    *partial_count = 0;
+    return EPD_REFRESH_FULL;
+#else
     epd_rect_t diff = epd_diff_rect(old_fb, new_fb);
     if (diff.w == 0 && diff.h == 0) return EPD_REFRESH_PARTIAL;
     epd_refresh_window(old_fb, new_fb, diff);
     (*partial_count)++;
     return EPD_REFRESH_PARTIAL;
+#endif
 }
 
 /* ---- Diff (unchanged) ---- */

@@ -1,3 +1,3 @@
 // wifi_credentials.h
-const char* ssid     = "SSID";
-const char* password = "password";
+const char* ssid     = "nazhiyath";
+const char* password = "04885226233";
